@@ -1,0 +1,217 @@
+package service
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"time"
+
+	"EXBanka/internal/config"
+	"EXBanka/internal/models"
+	"EXBanka/internal/repository"
+	infrasvc "EXBanka/internal/service"
+	"EXBanka/internal/util"
+
+	"gorm.io/gorm"
+)
+
+type AuthService struct {
+	cfg          *config.Config
+	employeeRepo *repository.EmployeeRepository
+	tokenRepo    *repository.TokenRepository
+	notifSvc     *infrasvc.NotificationService
+}
+
+func NewAuthService(cfg *config.Config, db *gorm.DB, notifSvc *infrasvc.NotificationService) *AuthService {
+	return &AuthService{
+		cfg:          cfg,
+		employeeRepo: repository.NewEmployeeRepository(db),
+		tokenRepo:    repository.NewTokenRepository(db),
+		notifSvc:     notifSvc,
+	}
+}
+
+func generateToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("failed to generate token: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func (s *AuthService) Login(email, password string) (string, string, *models.Employee, error) {
+	emp, err := s.employeeRepo.FindByEmail(email)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", "", nil, fmt.Errorf("invalid credentials")
+		}
+		return "", "", nil, err
+	}
+
+	if !emp.Aktivan {
+		return "", "", nil, fmt.Errorf("account is not active")
+	}
+
+	ok, err := util.VerifyPassword(password, emp.SaltPassword, emp.Password)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if !ok {
+		return "", "", nil, fmt.Errorf("invalid credentials")
+	}
+
+	perms := emp.PermissionNames()
+
+	accessToken, err := util.GenerateAccessToken(emp.ID, emp.Email, emp.Username, perms, s.cfg.JWTSecret, s.cfg.JWTAccessDuration)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	refreshToken, err := util.GenerateRefreshToken(emp.ID, emp.Email, emp.Username, s.cfg.JWTSecret, s.cfg.JWTRefreshDuration)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	return accessToken, refreshToken, emp, nil
+}
+
+func (s *AuthService) RefreshToken(refreshTokenStr string) (string, string, error) {
+	claims, err := util.ParseToken(refreshTokenStr, s.cfg.JWTSecret)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid refresh token")
+	}
+
+	if claims.TokenType != "refresh" {
+		return "", "", fmt.Errorf("wrong token type")
+	}
+
+	emp, err := s.employeeRepo.FindByID(claims.EmployeeID)
+	if err != nil {
+		return "", "", fmt.Errorf("employee not found")
+	}
+
+	if !emp.Aktivan {
+		return "", "", fmt.Errorf("account is not active")
+	}
+
+	perms := emp.PermissionNames()
+
+	accessToken, err := util.GenerateAccessToken(emp.ID, emp.Email, emp.Username, perms, s.cfg.JWTSecret, s.cfg.JWTAccessDuration)
+	if err != nil {
+		return "", "", err
+	}
+
+	newRefresh, err := util.GenerateRefreshToken(emp.ID, emp.Email, emp.Username, s.cfg.JWTSecret, s.cfg.JWTRefreshDuration)
+	if err != nil {
+		return "", "", err
+	}
+
+	return accessToken, newRefresh, nil
+}
+
+func (s *AuthService) ActivateAccount(tokenStr, password, passwordConfirm string) error {
+	if password != passwordConfirm {
+		return fmt.Errorf("passwords do not match")
+	}
+	if err := util.ValidatePasswordPolicy(password); err != nil {
+		return err
+	}
+
+	token, err := s.tokenRepo.FindValid(tokenStr, models.TokenTypeActivation)
+	if err != nil {
+		return fmt.Errorf("invalid or expired activation token")
+	}
+
+	if err := s.tokenRepo.InvalidateEmployeeTokens(token.EmployeeID, models.TokenTypeActivation); err != nil {
+		return err
+	}
+
+	salt, err := util.GenerateSalt()
+	if err != nil {
+		return err
+	}
+	hashed, err := util.HashPassword(password, salt)
+	if err != nil {
+		return err
+	}
+
+	if err := s.employeeRepo.UpdateFields(token.EmployeeID, map[string]interface{}{
+		"password":      hashed,
+		"salt_password": salt,
+		"aktivan":       true,
+	}); err != nil {
+		return err
+	}
+
+	emp, err := s.employeeRepo.FindByID(token.EmployeeID)
+	if err != nil {
+		return err
+	}
+
+	_ = s.notifSvc.SendConfirmationEmail(emp.Email, emp.Ime+" "+emp.Prezime)
+	return nil
+}
+
+func (s *AuthService) RequestPasswordReset(email string) error {
+	emp, err := s.employeeRepo.FindByEmail(email)
+	if err != nil {
+		// Do not reveal whether the email exists
+		return nil
+	}
+	if !emp.Aktivan {
+		return nil
+	}
+
+	_ = s.tokenRepo.InvalidateEmployeeTokens(emp.ID, models.TokenTypeReset)
+
+	tokenStr, err := generateToken()
+	if err != nil {
+		return err
+	}
+
+	token := &models.Token{
+		EmployeeID: emp.ID,
+		Token:      tokenStr,
+		Type:       models.TokenTypeReset,
+		ExpiresAt:  time.Now().Add(1 * time.Hour),
+	}
+	if err := s.tokenRepo.Create(token); err != nil {
+		return err
+	}
+
+	_ = s.notifSvc.SendResetPasswordEmail(emp.Email, emp.Ime+" "+emp.Prezime, tokenStr)
+	return nil
+}
+
+func (s *AuthService) ResetPassword(tokenStr, password, passwordConfirm string) error {
+	if password != passwordConfirm {
+		return fmt.Errorf("passwords do not match")
+	}
+	if err := util.ValidatePasswordPolicy(password); err != nil {
+		return err
+	}
+
+	token, err := s.tokenRepo.FindValid(tokenStr, models.TokenTypeReset)
+	if err != nil {
+		return fmt.Errorf("invalid or expired reset token")
+	}
+
+	if err := s.tokenRepo.InvalidateEmployeeTokens(token.EmployeeID, models.TokenTypeReset); err != nil {
+		return err
+	}
+
+	salt, err := util.GenerateSalt()
+	if err != nil {
+		return err
+	}
+	hashed, err := util.HashPassword(password, salt)
+	if err != nil {
+		return err
+	}
+
+	return s.employeeRepo.UpdateFields(token.EmployeeID, map[string]interface{}{
+		"password":      hashed,
+		"salt_password": salt,
+	})
+}
