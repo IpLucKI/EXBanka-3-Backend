@@ -117,6 +117,8 @@ func main() {
 
 	fundH := handler.NewFundHTTPHandler(cfg, fundSvc)
 
+	ibOtcLocalH := handler.NewInterbankOtcHTTPHandler(cfg, ibRegistry, ibClient, ibNegRepo)
+
 	grpcServer := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
 			middleware.LoggingInterceptor(),
@@ -165,6 +167,7 @@ func main() {
 	httpMux.Handle("/api/v1/tax/", middleware.CORS(http.HandlerFunc(taxH.TaxRoutes)))
 	httpMux.Handle("/api/v1/funds", middleware.CORS(http.HandlerFunc(fundH.FundRoutes)))
 	httpMux.Handle("/api/v1/funds/", middleware.CORS(http.HandlerFunc(fundH.FundRoutes)))
+	httpMux.Handle("/api/v1/interbank-otc/", middleware.CORS(http.HandlerFunc(ibOtcLocalH.Routes)))
 	// Inter-bank wire endpoint — partner-bank traffic, no CORS, X-Api-Key auth.
 	httpMux.Handle("/interbank", ibServer)
 	httpMux.Handle("/public-stock", interbank.AuthMiddleware(ibRegistry, http.HandlerFunc(ibOtcH.PublicStock)))
