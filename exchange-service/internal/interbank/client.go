@@ -154,6 +154,119 @@ func (c *Client) SendRollbackTx(ctx context.Context, partnerCode RoutingNumber, 
 	return err
 }
 
+// FetchPublicStock GETs the partner's /public-stock list — the catalogue
+// of OTC sellers the partner is willing to expose to peer banks. Spec §3.4.
+func (c *Client) FetchPublicStock(ctx context.Context, partnerCode RoutingNumber) (PublicStocksResponse, error) {
+	var out PublicStocksResponse
+	if err := c.doJSON(ctx, partnerCode, http.MethodGet, "/public-stock", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CreateNegotiation POSTs an OtcOffer to the seller's bank /negotiations
+// and returns the seller-minted ForeignBankId for the new negotiation.
+// Spec §3.2 — buyer's bank initiates by POSTing here.
+func (c *Client) CreateNegotiation(ctx context.Context, partnerCode RoutingNumber, offer OtcOffer) (ForeignBankId, error) {
+	var out ForeignBankId
+	if err := c.doJSON(ctx, partnerCode, http.MethodPost, "/negotiations", offer, &out); err != nil {
+		return ForeignBankId{}, err
+	}
+	return out, nil
+}
+
+// GetNegotiation reads the partner's authoritative copy of a negotiation
+// at /negotiations/{routingNumber}/{id}. Spec §3.3.
+func (c *Client) GetNegotiation(ctx context.Context, partnerCode RoutingNumber, routing RoutingNumber, id string) (*OtcNegotiation, error) {
+	var out OtcNegotiation
+	path := fmt.Sprintf("/negotiations/%d/%s", int(routing), id)
+	if err := c.doJSON(ctx, partnerCode, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// UpdateNegotiation PUTs a counter-offer to the partner's
+// /negotiations/{routingNumber}/{id} and returns the partner's updated
+// view of the negotiation. Spec §3.3.
+func (c *Client) UpdateNegotiation(ctx context.Context, partnerCode RoutingNumber, routing RoutingNumber, id string, offer OtcOffer) (*OtcNegotiation, error) {
+	var out OtcNegotiation
+	path := fmt.Sprintf("/negotiations/%d/%s", int(routing), id)
+	if err := c.doJSON(ctx, partnerCode, http.MethodPut, path, offer, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CloseNegotiation DELETEs /negotiations/{routingNumber}/{id} on the
+// partner. The partner is expected to flip is_ongoing → false; we send
+// the same DELETE for both buyer-side and seller-side closes. Spec §3.3.
+func (c *Client) CloseNegotiation(ctx context.Context, partnerCode RoutingNumber, routing RoutingNumber, id string) error {
+	path := fmt.Sprintf("/negotiations/%d/%s", int(routing), id)
+	return c.doJSON(ctx, partnerCode, http.MethodDelete, path, nil, nil)
+}
+
+// doJSON is the plain-HTTP analogue of sendEnvelope used by the §3 OTC
+// REST surface. It does NOT poll 202 Accepted — those replies are only
+// defined for the /interbank envelope endpoint. 204 No Content is
+// accepted as a successful empty response.
+func (c *Client) doJSON(ctx context.Context, partnerCode RoutingNumber, method, path string, in any, out any) error {
+	partner := c.registry.Lookup(partnerCode)
+	if partner == nil {
+		return fmt.Errorf("%w: %d", ErrNoSuchPartner, partnerCode)
+	}
+
+	var bodyReader io.Reader
+	if in != nil {
+		raw, err := json.Marshal(in)
+		if err != nil {
+			return fmt.Errorf("interbank: marshalling %s %s body: %w", method, path, err)
+		}
+		bodyReader = bytes.NewReader(raw)
+	}
+
+	endpoint := partner.BaseURL + path
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bodyReader)
+	if err != nil {
+		return fmt.Errorf("interbank: building %s %s request: %w", method, endpoint, err)
+	}
+	if in != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set(HeaderAPIKey, partner.OutboundKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("interbank: %s %s: %w", method, endpoint, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("interbank: reading response body from %s %s: %w", method, endpoint, readErr)
+	}
+
+	switch {
+	case resp.StatusCode == http.StatusNoContent:
+		return nil
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		if out == nil || len(respBody) == 0 {
+			return nil
+		}
+		if err := json.Unmarshal(respBody, out); err != nil {
+			return fmt.Errorf("interbank: decoding %s %s response: %w", method, endpoint, err)
+		}
+		return nil
+	default:
+		return &RemoteError{
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Body:       respBody,
+		}
+	}
+}
+
 // sendEnvelope is the workhorse: serialises the envelope, POSTs to
 // {partner.BaseURL}/interbank with the partner's OutboundKey, and
 // retries the SAME request (same idempotence key, same body) while the
