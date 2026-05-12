@@ -90,6 +90,22 @@ func (r *InterbankOtcRepository) MarkClosed(negotiationRoutingNumber int, negoti
 		}).Error
 }
 
+// MarkOngoing flips IsOngoing back to true. The accept handler calls
+// this when NEW_TX dispatch fails or the buyer's bank votes NO — the
+// negotiation reopens so the participants can keep haggling. The
+// LastModifiedBy fields are reset to whoever last touched the row so
+// the wire copy stays consistent with what the partner already saw.
+func (r *InterbankOtcRepository) MarkOngoing(negotiationRoutingNumber int, negotiationID string, lastModRouting int, lastModID string) error {
+	return r.db.Model(&models.InterbankOtcNegotiation{}).
+		Where("negotiation_routing_number = ? AND negotiation_id = ?", negotiationRoutingNumber, negotiationID).
+		Updates(map[string]interface{}{
+			"is_ongoing":                      true,
+			"last_modified_by_routing_number": lastModRouting,
+			"last_modified_by_id":             lastModID,
+			"updated_at":                      time.Now().UTC(),
+		}).Error
+}
+
 // ListByLocalParticipant returns the open negotiations where a given
 // local user is one of the two sides. role filters to "buyer" or
 // "seller"; pass "" for both.
